@@ -1,0 +1,6 @@
+{
+  "name": "FPL Pilot",
+  "description": "Fantasy Premier League manager assistant: Best starting XI, captain picks, transfer optimizer, fixture ticker, chip advisor, and live tracking.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
