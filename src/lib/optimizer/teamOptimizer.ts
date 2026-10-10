@@ -167,7 +167,9 @@ export function optimizeSquad(
         type: 'doubtful',
         message: `${el.chance_of_playing_next_round}% chance: ${el.news || 'Flagged'}`,
       });
-    } else if (p.xPtsBreakdown.fixtureCount === 0) {
+    }
+
+    if (p.xPtsBreakdown.fixtureCount === 0) {
       risks.push({
         playerId: el.id,
         playerName: el.web_name,
