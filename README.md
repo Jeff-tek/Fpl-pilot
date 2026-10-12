@@ -155,11 +155,11 @@ Runs the test suite verifying:
 
 ## 🚢 Deployment (Free Tier)
 
-### Option A: Vercel (Next.js / Node Serverless)
-1. Push this repository to GitHub.
-2. Import project into [Vercel](https://vercel.com).
-3. The build command is `npm run build`.
-4. Route requests to `/api/fpl/*` via standard Node/Edge function or server proxy.
+### Option A: Vercel
+1. Push this repository to GitHub and import it into [Vercel](https://vercel.com).
+2. Vercel uses the included `vercel.json` to build the Vite app and serve it from `dist`.
+3. The `/api/fpl/*` proxy runs as a Node.js serverless function. No API keys or additional environment variables are required.
+4. Use Node.js 22.x for local development and deployments.
 
 ### Option B: Cloudflare Pages / Workers
 1. Connect repository in Cloudflare Dashboard > Pages.

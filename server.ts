@@ -19,7 +19,7 @@ const hasDist = fs.existsSync(path.join(distPath, 'index.html'));
 const isProduction = process.env.NODE_ENV === 'production' || hasDist;
 
 // Fallback snapshots directory
-const DATA_DIR = path.resolve(__dirname, 'src', 'data');
+const DATA_DIR = path.resolve(process.cwd(), 'src', 'data');
 
 function loadFallbackJson(fileName: string): any | null {
   try {
@@ -348,4 +348,8 @@ async function startServer() {
   });
 }
 
-startServer();
+if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
+  startServer();
+}
+
+export default app;
