@@ -2,7 +2,7 @@ import express from 'express';
 import path from 'path';
 import fs from 'fs';
 import dns from 'dns';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 
 // Force IPv4 first DNS resolution for cloud container environments (prevents IPv6 routing timeouts)
 if (dns.setDefaultResultOrder) {
@@ -13,6 +13,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
+app.disable('x-powered-by');
+
 const PORT = Number(process.env.PORT) || 3000;
 const distPath = path.resolve(__dirname, 'dist');
 const hasDist = fs.existsSync(path.join(distPath, 'index.html'));
@@ -47,15 +49,15 @@ const memoryCache = new Map<string, CacheEntry>();
 // Cache TTL in milliseconds
 function getCacheTTL(urlPath: string): number {
   if (urlPath.includes('/event/') && urlPath.includes('/live')) {
-    return 60 * 1000; // 60s for live scores
+    return 60 * 1000;
   }
   if (urlPath.includes('/bootstrap-static') || urlPath.includes('/fixtures')) {
-    return 10 * 60 * 1000; // 10 minutes for static & fixtures
+    return 10 * 60 * 1000;
   }
   if (urlPath.includes('/element-summary')) {
-    return 10 * 60 * 1000; // 10 minutes for player element summaries
+    return 10 * 60 * 1000;
   }
-  return 5 * 60 * 1000; // 5 minutes default for entry, picks, history, leagues
+  return 5 * 60 * 1000;
 }
 
 app.use(express.json());
@@ -69,28 +71,24 @@ app.all('/api/fpl/purge-cache', (req, res) => {
 
 // FPL API proxy handler (handles /api/fpl and /api/fpl/*)
 app.get(['/api/fpl', '/api/fpl/*'], async (req, res) => {
-  // Support both /api/fpl/endpoint and /api/fpl?subpath=endpoint
   let fplSubpath = (req.params as any)[0] || '';
   if (!fplSubpath && req.path.startsWith('/api/fpl/')) {
     fplSubpath = req.path.replace(/^\/api\/fpl\//, '');
   }
-  
-  // Clean query string (strip refresh flag for clean forwarding and normalized cache key)
+
   const isForceRefresh = req.query.refresh === 'true' || req.headers['cache-control'] === 'no-cache';
-  
+
   const rawQuery = req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '';
   const cleanQuery = rawQuery
     .replace(/[?&]refresh=[^&]*/g, '')
     .replace(/^&/, '?');
   const normalizedQuery = cleanQuery === '?' ? '' : cleanQuery;
-  
-  // Target FPL API URL (strip trailing/leading slashes from subpath so URL is clean)
+
   const cleanSubpath = fplSubpath.replace(/^\/+|\/+$/g, '');
   if (!cleanSubpath) {
     return res.status(400).json({ error: 'missing_subpath', message: 'No FPL API endpoint specified.' });
   }
 
-  // Helper to serve snapshot data if available
   const serveFallbackIfAvailable = () => {
     if (cleanSubpath.startsWith('bootstrap-static')) {
       const fb = loadFallbackJson('bootstrap-fallback.json');
@@ -108,7 +106,6 @@ app.get(['/api/fpl', '/api/fpl/*'], async (req, res) => {
         return res.status(200).json(fb);
       }
     }
-    // Team 2432 demo snapshots
     if (/^entry\/2432(?:\/|$)/.test(cleanSubpath)) {
       if (cleanSubpath.includes('picks')) {
         const fb = loadFallbackJson('demo-picks-2432.json');
@@ -126,7 +123,6 @@ app.get(['/api/fpl', '/api/fpl/*'], async (req, res) => {
           return res.status(200).json(fb);
         }
       }
-      // Entry profile
       const fb = loadFallbackJson('demo-entry-2432.json');
       if (fb) {
         res.setHeader('X-Fallback', 'true');
@@ -134,7 +130,6 @@ app.get(['/api/fpl', '/api/fpl/*'], async (req, res) => {
         return res.status(200).json(fb);
       }
     }
-    // Team 1 demo snapshots
     if (cleanSubpath === 'entry/1' || cleanSubpath.startsWith('entry/1/')) {
       if (cleanSubpath.includes('picks')) {
         const fb = loadFallbackJson('demo-picks-1.json');
@@ -165,6 +160,7 @@ app.get(['/api/fpl', '/api/fpl/*'], async (req, res) => {
       res.setHeader('X-FPL-Status', 'empty-history');
       return res.status(200).json({ current: [], past: [], chips: [] });
     }
+
     const entryMatch = cleanSubpath.match(/^entry\/(\d+)/);
     if (entryMatch) {
       const idNum = Number(entryMatch[1]);
@@ -186,23 +182,24 @@ app.get(['/api/fpl', '/api/fpl/*'], async (req, res) => {
         leagues: { classic: [], h2h: [] },
       });
     }
+
     if (cleanSubpath.includes('/live')) {
       res.setHeader('X-Fallback', 'true');
       res.setHeader('X-FPL-Status', 'empty-live');
       return res.status(200).json({ elements: [] });
     }
+
     if (cleanSubpath.startsWith('element-summary/')) {
       res.setHeader('X-Fallback', 'true');
       res.setHeader('X-FPL-Status', 'empty-summary');
       return res.status(200).json({ fixtures: [], history: [], history_past: [] });
     }
+
     return null;
   };
 
-  // Normalized cache key without ephemeral query params
   const cacheKey = `${cleanSubpath}${normalizedQuery}`;
 
-  // If force refresh is requested, purge any cached items matching this subpath
   if (isForceRefresh) {
     memoryCache.delete(cacheKey);
     for (const key of memoryCache.keys()) {
@@ -229,8 +226,7 @@ app.get(['/api/fpl', '/api/fpl/*'], async (req, res) => {
     let fplResponse = await fetch(targetUrl, {
       redirect: 'follow',
       headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
         Accept: 'application/json, text/plain, */*',
         'Accept-Language': 'en-GB,en;q=0.9',
         Referer: 'https://fantasy.premierleague.com/',
@@ -239,7 +235,6 @@ app.get(['/api/fpl', '/api/fpl/*'], async (req, res) => {
 
     let contentType = fplResponse.headers.get('content-type') || '';
 
-    // If FPL blocks the browser user-agent or returns non-JSON, retry with clean curl user-agent
     if (fplResponse.status === 403 || !contentType.includes('application/json')) {
       try {
         const retryRes = await fetch(targetUrl, {
@@ -258,7 +253,6 @@ app.get(['/api/fpl', '/api/fpl/*'], async (req, res) => {
       }
     }
 
-    // If FPL returns 503 (updating) or HTML maintenance page
     if (fplResponse.status === 503 || !contentType.includes('application/json')) {
       if (cached) {
         res.setHeader('X-Cache-Hit', 'stale');
@@ -266,7 +260,6 @@ app.get(['/api/fpl', '/api/fpl/*'], async (req, res) => {
         return res.status(200).json(cached.data);
       }
 
-      // Check for pre-cached snapshot fallback
       const fallbackServed = serveFallbackIfAvailable();
       if (fallbackServed) return;
 
@@ -280,7 +273,6 @@ app.get(['/api/fpl', '/api/fpl/*'], async (req, res) => {
     const data = await fplResponse.json();
     const ttl = getCacheTTL(cleanSubpath);
 
-    // Save into cache if successful
     if (fplResponse.status === 200) {
       memoryCache.set(cacheKey, {
         data,
@@ -296,14 +288,12 @@ app.get(['/api/fpl', '/api/fpl/*'], async (req, res) => {
   } catch (error: any) {
     console.error(`Error proxying FPL request to ${targetUrl}:`, error);
 
-    // Fallback to stale cache if network error occurs
     if (cached) {
       res.setHeader('X-Cache-Hit', 'stale');
       res.setHeader('X-Cached-At', new Date(cached.cachedAt).toISOString());
       return res.status(200).json(cached.data);
     }
 
-    // Check for pre-cached snapshot fallback
     const fallbackServed = serveFallbackIfAvailable();
     if (fallbackServed) return;
 
@@ -315,7 +305,6 @@ app.get(['/api/fpl', '/api/fpl/*'], async (req, res) => {
   }
 });
 
-// JSON 404 catch-all for any unhandled /api/* routes so Vite NEVER returns HTML
 app.all('/api/*', (req, res) => {
   return res.status(404).json({
     error: 'endpoint_not_found',
@@ -332,9 +321,7 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    // Serve static files in production
     app.use(express.static(path.resolve(__dirname, 'dist')));
-    // Prevent missing static assets from falling through to index.html (which causes JS SyntaxError '<')
     app.all('/assets/*', (req, res) => {
       res.status(404).type('text/plain').send('Asset not found');
     });
@@ -348,7 +335,12 @@ async function startServer() {
   });
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
+const isDirectExecution =
+  typeof process.argv[1] === 'string' &&
+  (path.resolve(process.argv[1]) === __filename ||
+    import.meta.url === pathToFileURL(process.argv[1]).href);
+
+if (isDirectExecution) {
   startServer();
 }
 
