@@ -309,53 +309,10 @@ export default function App() {
           }
         }
 
-        // 6. If demo team specifically requested and still no picks, load bundled snapshot
-        if (!picksRes && teamId === 2432) {
-          try {
-            const demo = await import('./data/demo-picks-2432.json');
-            picksRes = (demo.default || demo) as unknown as FPLPicksResponse;
-          } catch {
-            // ignore
-          }
-        } else if (!picksRes && teamId === 1) {
-          try {
-            const demo = await import('./data/demo-picks-1.json');
-            picksRes = (demo.default || demo) as unknown as FPLPicksResponse;
-          } catch {
-            // ignore
-          }
-        }
-
-        // 7. If still no squad picks found across all gameweeks, fallback to template snapshot
-        let isUsingTemplate = false;
         if (!picksRes) {
-          try {
-            const demo = await import('./data/demo-picks-2432.json');
-            picksRes = (demo.default || demo) as unknown as FPLPicksResponse;
-            isUsingTemplate = true;
-          } catch {
-            // ignore
-          }
-        }
-
-        if (!picksRes) {
-          picksRes = {
-            active_chip: null,
-            automatic_subs: [],
-            picks: [],
-            entry_history: {
-              event: activeCurrentEvent.id,
-              points: 0,
-              total_points: 0,
-              rank: 0,
-              overall_rank: 0,
-              bank: 0,
-              value: 1000,
-              event_transfers: 0,
-              event_transfers_cost: 0,
-              points_on_bench: 0,
-            },
-          };
+          throw new Error(
+            `Could not load official picks for Team #${teamId}. FPL may be updating, or the team has no submitted squad yet. Please try again later.`
+          );
         }
 
         // Save into local cache for offline resilience
@@ -394,19 +351,12 @@ export default function App() {
         setPicksData(picksRes);
         localStorage.setItem(LOCAL_STORAGE_TEAM_KEY, teamId!.toString());
 
-        if (isUsingTemplate) {
-          setSyncFeedback({
-            message: `Official FPL servers are currently updating or Team #${teamId} has no submitted squad yet. We've loaded an active Gameweek template so you can use all tools immediately.`,
-            type: 'info',
-          });
-        } else {
-          const squadGw = (picksRes as FPLPicksResponse).entry_history?.event || activeCurrentEvent.id;
-          const mgrName = entryRes.player_first_name ? ` (${entryRes.player_first_name} ${entryRes.player_last_name})` : '';
-          setSyncFeedback({
-            message: `Loaded Gameweek ${squadGw} squad for ${entryRes.name}${mgrName}. (Note: transfers for upcoming Gameweek ${activeCurrentEvent.id + 1} remain private until the deadline; tap "Edit Squad" if you made recent transfers!)`,
-            type: 'success',
-          });
-        }
+        const squadGw = picksRes.entry_history?.event || activeCurrentEvent.id;
+        const mgrName = entryRes.player_first_name ? ` (${entryRes.player_first_name} ${entryRes.player_last_name})` : '';
+        setSyncFeedback({
+          message: `Loaded Gameweek ${squadGw} squad for ${entryRes.name}${mgrName}. (Note: transfers for upcoming Gameweek ${activeCurrentEvent.id + 1} remain private until the deadline; tap "Edit Squad" if you made recent transfers!)`,
+          type: 'success',
+        });
       } catch (err: any) {
         console.error('Failed to load team data:', err);
         setError(
@@ -589,6 +539,16 @@ export default function App() {
   }, [userSquad, allAnalyzedPlayers, effectiveBank]);
 
   const handleSetTeamId = (id: number) => {
+    if (id !== teamId) {
+      setEntry(null);
+      setPicksData(null);
+      setHistory(null);
+      setCustomSquadIds(null);
+      setCustomBank(null);
+      setSyncFeedback(null);
+      setLoading(true);
+    }
+    setError(null);
     setTeamId(id);
     localStorage.setItem(LOCAL_STORAGE_TEAM_KEY, id.toString());
   };
@@ -655,8 +615,7 @@ export default function App() {
         picksRes = picksData;
       }
       if (!picksRes) {
-        const demo = await import('./data/demo-picks-2432.json');
-        picksRes = (demo.default || demo) as unknown as FPLPicksResponse;
+        throw new Error(`Could not refresh official picks for Team #${teamId}. Please try again later.`);
       }
 
       // 2. Fetch fresh entry profile and history with fallback

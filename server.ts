@@ -109,7 +109,7 @@ app.get(['/api/fpl', '/api/fpl/*'], async (req, res) => {
       }
     }
     // Team 2432 demo snapshots
-    if (cleanSubpath.includes('2432')) {
+    if (/^entry\/2432(?:\/|$)/.test(cleanSubpath)) {
       if (cleanSubpath.includes('picks')) {
         const fb = loadFallbackJson('demo-picks-2432.json');
         if (fb) {
