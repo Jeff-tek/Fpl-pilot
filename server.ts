@@ -1,13 +1,38 @@
 import express from 'express';
 import path from 'path';
+import fs from 'fs';
+import dns from 'dns';
 import { fileURLToPath } from 'url';
+
+// Force IPv4 first DNS resolution for cloud container environments (prevents IPv6 routing timeouts)
+if (dns.setDefaultResultOrder) {
+  dns.setDefaultResultOrder('ipv4first');
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
-const isProduction = process.env.NODE_ENV === 'production';
+const distPath = path.resolve(__dirname, 'dist');
+const hasDist = fs.existsSync(path.join(distPath, 'index.html'));
+const isProduction = process.env.NODE_ENV === 'production' || hasDist;
+
+// Fallback snapshots directory
+const DATA_DIR = path.resolve(__dirname, 'src', 'data');
+
+function loadFallbackJson(fileName: string): any | null {
+  try {
+    const filePath = path.join(DATA_DIR, fileName);
+    if (fs.existsSync(filePath)) {
+      const content = fs.readFileSync(filePath, 'utf-8');
+      return JSON.parse(content);
+    }
+  } catch (err) {
+    console.warn(`Could not load fallback file ${fileName}:`, err);
+  }
+  return null;
+}
 
 // In-memory cache store
 interface CacheEntry {
@@ -65,13 +90,121 @@ app.get(['/api/fpl', '/api/fpl/*'], async (req, res) => {
     return res.status(400).json({ error: 'missing_subpath', message: 'No FPL API endpoint specified.' });
   }
 
+  // Helper to serve snapshot data if available
+  const serveFallbackIfAvailable = () => {
+    if (cleanSubpath.startsWith('bootstrap-static')) {
+      const fb = loadFallbackJson('bootstrap-fallback.json');
+      if (fb) {
+        res.setHeader('X-Fallback', 'true');
+        res.setHeader('X-FPL-Status', 'offline-snapshot');
+        return res.status(200).json(fb);
+      }
+    }
+    if (cleanSubpath.startsWith('fixtures')) {
+      const fb = loadFallbackJson('fixtures-fallback.json');
+      if (fb) {
+        res.setHeader('X-Fallback', 'true');
+        res.setHeader('X-FPL-Status', 'offline-snapshot');
+        return res.status(200).json(fb);
+      }
+    }
+    // Team 2432 demo snapshots
+    if (cleanSubpath.includes('2432')) {
+      if (cleanSubpath.includes('picks')) {
+        const fb = loadFallbackJson('demo-picks-2432.json');
+        if (fb) {
+          res.setHeader('X-Fallback', 'true');
+          res.setHeader('X-FPL-Status', 'demo-snapshot');
+          return res.status(200).json(fb);
+        }
+      }
+      if (cleanSubpath.includes('history')) {
+        const fb = loadFallbackJson('demo-history-2432.json');
+        if (fb) {
+          res.setHeader('X-Fallback', 'true');
+          res.setHeader('X-FPL-Status', 'demo-snapshot');
+          return res.status(200).json(fb);
+        }
+      }
+      // Entry profile
+      const fb = loadFallbackJson('demo-entry-2432.json');
+      if (fb) {
+        res.setHeader('X-Fallback', 'true');
+        res.setHeader('X-FPL-Status', 'demo-snapshot');
+        return res.status(200).json(fb);
+      }
+    }
+    // Team 1 demo snapshots
+    if (cleanSubpath === 'entry/1' || cleanSubpath.startsWith('entry/1/')) {
+      if (cleanSubpath.includes('picks')) {
+        const fb = loadFallbackJson('demo-picks-1.json');
+        if (fb) {
+          res.setHeader('X-Fallback', 'true');
+          res.setHeader('X-FPL-Status', 'demo-snapshot');
+          return res.status(200).json(fb);
+        }
+      }
+      if (cleanSubpath.includes('history')) {
+        const fb = loadFallbackJson('demo-history-1.json');
+        if (fb) {
+          res.setHeader('X-Fallback', 'true');
+          res.setHeader('X-FPL-Status', 'demo-snapshot');
+          return res.status(200).json(fb);
+        }
+      }
+      const fb = loadFallbackJson('demo-entry-1.json');
+      if (fb) {
+        res.setHeader('X-Fallback', 'true');
+        res.setHeader('X-FPL-Status', 'demo-snapshot');
+        return res.status(200).json(fb);
+      }
+    }
+
+    if (cleanSubpath.includes('/history')) {
+      res.setHeader('X-Fallback', 'true');
+      res.setHeader('X-FPL-Status', 'empty-history');
+      return res.status(200).json({ current: [], past: [], chips: [] });
+    }
+    const entryMatch = cleanSubpath.match(/^entry\/(\d+)/);
+    if (entryMatch) {
+      const idNum = Number(entryMatch[1]);
+      res.setHeader('X-Fallback', 'true');
+      res.setHeader('X-FPL-Status', 'synthesized-profile');
+      return res.status(200).json({
+        id: idNum,
+        name: `Team #${idNum}`,
+        player_first_name: 'FPL',
+        player_last_name: 'Manager',
+        summary_overall_points: 0,
+        summary_overall_rank: 0,
+        summary_event_points: 0,
+        summary_event_rank: 0,
+        current_event: 6,
+        last_deadline_bank: 0,
+        last_deadline_value: 1000,
+        last_deadline_total_transfers: 0,
+        leagues: { classic: [], h2h: [] },
+      });
+    }
+    if (cleanSubpath.includes('/live')) {
+      res.setHeader('X-Fallback', 'true');
+      res.setHeader('X-FPL-Status', 'empty-live');
+      return res.status(200).json({ elements: [] });
+    }
+    if (cleanSubpath.startsWith('element-summary/')) {
+      res.setHeader('X-Fallback', 'true');
+      res.setHeader('X-FPL-Status', 'empty-summary');
+      return res.status(200).json({ fixtures: [], history: [], history_past: [] });
+    }
+    return null;
+  };
+
   // Normalized cache key without ephemeral query params
   const cacheKey = `${cleanSubpath}${normalizedQuery}`;
 
-  // If force refresh is requested, purge any cached items matching this subpath (e.g. entry/123/...)
+  // If force refresh is requested, purge any cached items matching this subpath
   if (isForceRefresh) {
     memoryCache.delete(cacheKey);
-    // If refreshing an entry, clear all sub-routes for that entry
     for (const key of memoryCache.keys()) {
       if (key.startsWith(cleanSubpath) || cleanSubpath.startsWith(key)) {
         memoryCache.delete(key);
@@ -88,26 +221,55 @@ app.get(['/api/fpl', '/api/fpl/*'], async (req, res) => {
     return res.status(cached.status).json(cached.data);
   }
 
-  const targetUrl = `https://fantasy.premierleague.com/api/${cleanSubpath}/${normalizedQuery}`;
+  const cleanSubpathWithSlash = cleanSubpath.endsWith('/') ? cleanSubpath : `${cleanSubpath}/`;
+  const queryString = normalizedQuery ? (normalizedQuery.startsWith('?') ? normalizedQuery : `?${normalizedQuery}`) : '';
+  const targetUrl = `https://fantasy.premierleague.com/api/${cleanSubpathWithSlash}${queryString}`;
 
   try {
-    const fplResponse = await fetch(targetUrl, {
+    let fplResponse = await fetch(targetUrl, {
+      redirect: 'follow',
       headers: {
         'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 FPLPilot/1.0',
-        Accept: 'application/json',
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+        Accept: 'application/json, text/plain, */*',
+        'Accept-Language': 'en-GB,en;q=0.9',
+        Referer: 'https://fantasy.premierleague.com/',
       },
     });
 
-    const contentType = fplResponse.headers.get('content-type') || '';
+    let contentType = fplResponse.headers.get('content-type') || '';
 
-    // If FPL returns 503 (updating) or HTML maintenance page, return friendly error or serve stale cache if available
+    // If FPL blocks the browser user-agent or returns non-JSON, retry with clean curl user-agent
+    if (fplResponse.status === 403 || !contentType.includes('application/json')) {
+      try {
+        const retryRes = await fetch(targetUrl, {
+          redirect: 'follow',
+          headers: {
+            'User-Agent': 'curl/8.0.1',
+            Accept: '*/*',
+          },
+        });
+        if (retryRes.ok && (retryRes.headers.get('content-type') || '').includes('application/json')) {
+          fplResponse = retryRes;
+          contentType = retryRes.headers.get('content-type') || '';
+        }
+      } catch {
+        // ignore retry error
+      }
+    }
+
+    // If FPL returns 503 (updating) or HTML maintenance page
     if (fplResponse.status === 503 || !contentType.includes('application/json')) {
       if (cached) {
         res.setHeader('X-Cache-Hit', 'stale');
         res.setHeader('X-Cached-At', new Date(cached.cachedAt).toISOString());
         return res.status(200).json(cached.data);
       }
+
+      // Check for pre-cached snapshot fallback
+      const fallbackServed = serveFallbackIfAvailable();
+      if (fallbackServed) return;
+
       return res.status(503).json({
         error: 'fpl_maintenance',
         message: 'The official Fantasy Premier League game is currently undergoing live game updates. Please try again shortly.',
@@ -141,6 +303,10 @@ app.get(['/api/fpl', '/api/fpl/*'], async (req, res) => {
       return res.status(200).json(cached.data);
     }
 
+    // Check for pre-cached snapshot fallback
+    const fallbackServed = serveFallbackIfAvailable();
+    if (fallbackServed) return;
+
     return res.status(502).json({
       error: 'proxy_fetch_failed',
       message: 'Failed to reach Fantasy Premier League servers. Check your internet connection.',
@@ -168,6 +334,10 @@ async function startServer() {
   } else {
     // Serve static files in production
     app.use(express.static(path.resolve(__dirname, 'dist')));
+    // Prevent missing static assets from falling through to index.html (which causes JS SyntaxError '<')
+    app.all('/assets/*', (req, res) => {
+      res.status(404).type('text/plain').send('Asset not found');
+    });
     app.get('*', (req, res) => {
       res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
     });

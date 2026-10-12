@@ -56,6 +56,14 @@ const LOCAL_STORAGE_WEIGHTS_KEY = 'fpl_pilot_model_weights';
 const LOCAL_STORAGE_DIFF_KEY = 'fpl_pilot_prefer_diff';
 const LOCAL_STORAGE_CUSTOM_SQUAD_PREFIX = 'fpl_pilot_custom_squad_';
 
+function isDemo2432Squad(picks: any[], targetTeamId: number): boolean {
+  if (targetTeamId === 2432) return false;
+  if (!Array.isArray(picks) || picks.length !== 15) return false;
+  const demoElements = [496, 449, 8, 334, 31, 154, 12, 40, 368, 411, 249, 623, 124, 277, 165];
+  const count = picks.filter((p) => demoElements.includes(p.element)).length;
+  return count >= 14;
+}
+
 export default function App() {
   // Navigation State
   const [activeTab, setActiveTab] = useState<
@@ -222,58 +230,188 @@ export default function App() {
         setLoading(true);
         setError(null);
 
-        const gwToFetch = activeCurrentEvent.id;
-        
-        // 1. Fetch squad picks (critical payload)
-        let picksRes: FPLPicksResponse;
+        // 1. Fetch entry profile and history in parallel (soft fail)
+        let entryRes: FPLEntry | null = null;
+        let historyRes: FPLHistory | null = null;
         try {
-          picksRes = await fetchEntryPicks(teamId!, gwToFetch);
-        } catch (pickErr) {
-          if (gwToFetch > 1) {
-            picksRes = await fetchEntryPicks(teamId!, gwToFetch - 1);
-          } else {
-            throw pickErr;
+          entryRes = await fetchEntry(teamId!);
+        } catch (e) {
+          console.warn(`Direct fetchEntry for ${teamId} failed (FPL updating or maintenance):`, e);
+        }
+        try {
+          historyRes = await fetchEntryHistory(teamId!);
+        } catch (e) {
+          console.warn(`Direct fetchEntryHistory for ${teamId} failed:`, e);
+        }
+
+        // 2. Determine best gameweeks to query picks from
+        // Priority: actual gameweeks recorded in team history (latest first), then current down to 1
+        const candidateGWs: number[] = [];
+        if (historyRes && Array.isArray(historyRes.current) && historyRes.current.length > 0) {
+          const recorded = historyRes.current
+            .map((h) => h.event)
+            .filter((evt): evt is number => typeof evt === 'number' && evt > 0);
+          for (let i = recorded.length - 1; i >= 0; i--) {
+            if (!candidateGWs.includes(recorded[i])) {
+              candidateGWs.push(recorded[i]);
+            }
+          }
+        }
+        const currentGwId = activeCurrentEvent.id;
+        for (let gw = currentGwId; gw >= 1; gw--) {
+          if (!candidateGWs.includes(gw)) {
+            candidateGWs.push(gw);
           }
         }
 
-        // 2. Fetch Entry profile and History in parallel, synthesizing fallback if FPL entry API is updating (503)
-        const [entryRes, historyRes] = await Promise.all([
-          fetchEntry(teamId!).catch((entryErr) => {
-            console.warn('FPL entry profile updating, creating entry from picks history:', entryErr);
-            const h = picksRes.entry_history;
-            const fallbackEntry: FPLEntry = {
-              id: teamId!,
-              name: `Team #${teamId}`,
-              player_first_name: 'Manager',
-              player_last_name: '',
-              summary_overall_points: h?.total_points || 0,
-              summary_overall_rank: h?.overall_rank || 0,
-              summary_event_points: h?.points || 0,
-              summary_event_rank: h?.rank || 0,
-              current_event: h?.event || gwToFetch,
-              last_deadline_bank: h?.bank ?? 0,
-              last_deadline_value: h?.value ?? 1000,
-              last_deadline_total_transfers: h?.event_transfers ?? 0,
-              leagues: { classic: [], h2h: [] },
-            };
-            return fallbackEntry;
-          }),
-          fetchEntryHistory(teamId!).catch(() => ({
-            current: [],
-            past: [],
-            chips: [],
-          })),
-        ]);
+        // 3. Purge accidental demo cache if stored for a custom team ID
+        const rawCachedPicks = localStorage.getItem(`fpl_cached_picks_${teamId}`);
+        if (rawCachedPicks && teamId !== 2432) {
+          try {
+            const parsed = JSON.parse(rawCachedPicks);
+            if (isDemo2432Squad(parsed?.picks, teamId!)) {
+              localStorage.removeItem(`fpl_cached_picks_${teamId}`);
+            }
+          } catch {
+            // ignore
+          }
+        }
+
+        // 4. Fetch squad picks with multi-GW retry from official FPL API
+        let picksRes: FPLPicksResponse | null = null;
+        for (const gw of candidateGWs) {
+          try {
+            const candidate = await fetchEntryPicks(teamId!, gw, true);
+            if (candidate && Array.isArray(candidate.picks) && candidate.picks.length > 0) {
+              if (teamId !== 2432 && isDemo2432Squad(candidate.picks, teamId!)) {
+                continue;
+              }
+              picksRes = candidate;
+              break;
+            }
+          } catch {
+            // try next candidate gameweek
+          }
+        }
+
+        // 5. If network fetch failed, check local storage cached picks for this team (if valid)
+        if (!picksRes) {
+          const cachedPicksStr = localStorage.getItem(`fpl_cached_picks_${teamId}`);
+          if (cachedPicksStr) {
+            try {
+              const parsed = JSON.parse(cachedPicksStr);
+              if (!isDemo2432Squad(parsed?.picks, teamId!)) {
+                picksRes = parsed;
+              }
+            } catch {
+              // ignore
+            }
+          }
+        }
+
+        // 6. If demo team specifically requested and still no picks, load bundled snapshot
+        if (!picksRes && teamId === 2432) {
+          try {
+            const demo = await import('./data/demo-picks-2432.json');
+            picksRes = (demo.default || demo) as unknown as FPLPicksResponse;
+          } catch {
+            // ignore
+          }
+        } else if (!picksRes && teamId === 1) {
+          try {
+            const demo = await import('./data/demo-picks-1.json');
+            picksRes = (demo.default || demo) as unknown as FPLPicksResponse;
+          } catch {
+            // ignore
+          }
+        }
+
+        // 7. If still no squad picks found across all gameweeks, fallback to template snapshot
+        let isUsingTemplate = false;
+        if (!picksRes) {
+          try {
+            const demo = await import('./data/demo-picks-2432.json');
+            picksRes = (demo.default || demo) as unknown as FPLPicksResponse;
+            isUsingTemplate = true;
+          } catch {
+            // ignore
+          }
+        }
+
+        if (!picksRes) {
+          picksRes = {
+            active_chip: null,
+            automatic_subs: [],
+            picks: [],
+            entry_history: {
+              event: activeCurrentEvent.id,
+              points: 0,
+              total_points: 0,
+              rank: 0,
+              overall_rank: 0,
+              bank: 0,
+              value: 1000,
+              event_transfers: 0,
+              event_transfers_cost: 0,
+              points_on_bench: 0,
+            },
+          };
+        }
+
+        // Save into local cache for offline resilience
+        try {
+          localStorage.setItem(`fpl_cached_picks_${teamId}`, JSON.stringify(picksRes));
+        } catch {
+          // ignore storage quota errors
+        }
+
+        // 7. Synthesize entry profile if FPL entry API was updating (503)
+        if (!entryRes) {
+          const h = (picksRes as FPLPicksResponse).entry_history;
+          entryRes = {
+            id: teamId!,
+            name: `Team #${teamId}`,
+            player_first_name: 'Manager',
+            player_last_name: '',
+            summary_overall_points: h?.total_points || 0,
+            summary_overall_rank: h?.overall_rank || 0,
+            summary_event_points: h?.points || 0,
+            summary_event_rank: h?.rank || 0,
+            current_event: h?.event || activeCurrentEvent.id,
+            last_deadline_bank: h?.bank ?? 0,
+            last_deadline_value: h?.value ?? 1000,
+            last_deadline_total_transfers: h?.event_transfers ?? 0,
+            leagues: { classic: [], h2h: [] },
+          };
+        }
+
+        if (!historyRes) {
+          historyRes = { current: [], past: [], chips: [] };
+        }
 
         setEntry(entryRes);
         setHistory(historyRes);
         setPicksData(picksRes);
         localStorage.setItem(LOCAL_STORAGE_TEAM_KEY, teamId!.toString());
+
+        if (isUsingTemplate) {
+          setSyncFeedback({
+            message: `Official FPL servers are currently updating or Team #${teamId} has no submitted squad yet. We've loaded an active Gameweek template so you can use all tools immediately.`,
+            type: 'info',
+          });
+        } else {
+          const squadGw = (picksRes as FPLPicksResponse).entry_history?.event || activeCurrentEvent.id;
+          const mgrName = entryRes.player_first_name ? ` (${entryRes.player_first_name} ${entryRes.player_last_name})` : '';
+          setSyncFeedback({
+            message: `Loaded Gameweek ${squadGw} squad for ${entryRes.name}${mgrName}. (Note: transfers for upcoming Gameweek ${activeCurrentEvent.id + 1} remain private until the deadline; tap "Edit Squad" if you made recent transfers!)`,
+            type: 'success',
+          });
+        }
       } catch (err: any) {
         console.error('Failed to load team data:', err);
         setError(
           err.message ||
-            'Could not find FPL Team. Please verify your team ID (e.g. 1, 1000, 25000).'
+            'Could not load FPL Team data. Please check your team ID or try Demo Team #2432.'
         );
       } finally {
         setLoading(false);
@@ -352,13 +490,53 @@ export default function App() {
 
     const analyzedMap = new Map(allAnalyzedPlayers.map((p) => [p.element.id, p]));
 
+    // Safe helper to resolve player or create fallback
+    const resolvePlayer = (id: number): PlayerWithAnalysis => {
+      const existing = analyzedMap.get(id);
+      if (existing) return existing;
+      const defaultTeam = bootstrap?.teams[0] || ({ id: 1, name: 'Club', short_name: 'CLB' } as any);
+      return {
+        element: {
+          id,
+          web_name: `Player #${id}`,
+          first_name: 'FPL',
+          second_name: 'Player',
+          element_type: 2,
+          team: defaultTeam.id,
+          now_cost: 50,
+          selected_by_percent: '1.0',
+          form: '3.0',
+          total_points: 0,
+          status: 'a',
+          chance_of_playing_next_round: 100,
+          news: '',
+        } as any,
+        team: defaultTeam,
+        positionName: 'DEF',
+        xPts: 3.0,
+        xPtsBreakdown: {
+          baseMinutesScore: 2.0,
+          attackingExpectedScore: 0.5,
+          defensiveExpectedScore: 0.5,
+          bonusEstimate: 0,
+          fixtureMultiplier: 1.0,
+          playingProbability: 1.0,
+          fixtureCount: 1,
+          reasons: ['Baseline squad projection'],
+        },
+        upcomingFixtures: [],
+        sellingPrice: 50,
+        isStarter: false,
+        isCaptain: false,
+        isViceCaptain: false,
+        pickPosition: 0,
+      };
+    };
+
     // If custom squad pending transfers exist, build squad with newly bought players
     if (customSquadIds && customSquadIds.length === 15) {
       return customSquadIds.map((id, index) => {
-        const base = analyzedMap.get(id);
-        if (!base) {
-          throw new Error(`Player ID ${id} missing from game data.`);
-        }
+        const base = resolvePlayer(id);
         const existingPick = picksData.picks.find((p) => p.element === id);
         return {
           ...base,
@@ -371,11 +549,7 @@ export default function App() {
     }
 
     return picksData.picks.map((pick) => {
-      const base = analyzedMap.get(pick.element);
-      if (!base) {
-        throw new Error(`Player ID ${pick.element} missing from game data.`);
-      }
-
+      const base = resolvePlayer(pick.element);
       return {
         ...base,
         isStarter: pick.position <= 11,
@@ -384,7 +558,7 @@ export default function App() {
         pickPosition: pick.position,
       };
     });
-  }, [picksData, allAnalyzedPlayers, customSquadIds]);
+  }, [picksData, allAnalyzedPlayers, customSquadIds, bootstrap]);
 
   // Effective Bank (respects manual transfers or official picks)
   const effectiveBank = customBank !== null ? customBank : (picksData?.entry_history?.bank || 0);
@@ -467,16 +641,22 @@ export default function App() {
       await purgeProxyCache();
       const gwToFetch = currentEvent.id;
 
-      // 1. Fetch fresh picks from FPL
-      let picksRes: FPLPicksResponse;
-      try {
-        picksRes = await fetchEntryPicks(teamId, gwToFetch, true);
-      } catch (pickErr) {
-        if (gwToFetch > 1) {
-          picksRes = await fetchEntryPicks(teamId, gwToFetch - 1, true);
-        } else {
-          throw pickErr;
+      // 1. Fetch fresh picks from FPL across candidate gameweeks
+      let picksRes: FPLPicksResponse | null = null;
+      for (let gw = gwToFetch; gw >= 1; gw--) {
+        try {
+          picksRes = await fetchEntryPicks(teamId, gw, true);
+          if (picksRes && Array.isArray(picksRes.picks) && picksRes.picks.length > 0) break;
+        } catch {
+          // try previous gameweek
         }
+      }
+      if (!picksRes) {
+        picksRes = picksData;
+      }
+      if (!picksRes) {
+        const demo = await import('./data/demo-picks-2432.json');
+        picksRes = (demo.default || demo) as unknown as FPLPicksResponse;
       }
 
       // 2. Fetch fresh entry profile and history with fallback
@@ -674,18 +854,33 @@ export default function App() {
 
         {/* Error Notification */}
         {error && (
-          <div className="mb-4 p-4 rounded-2xl bg-rose-950/40 border border-rose-800/80 flex items-start gap-3 text-xs text-rose-200">
-            <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
-            <div className="flex-1">
-              <div className="font-bold text-rose-300">Notice</div>
-              <div>{error}</div>
+          <div className="mb-4 p-4 rounded-2xl bg-rose-950/40 border border-rose-800/80 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-xs text-rose-200">
+            <div className="flex items-start gap-3">
+              <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+              <div>
+                <div className="font-bold text-rose-300">Notice</div>
+                <div>{error}</div>
+              </div>
             </div>
-            <button
-              onClick={() => setError(null)}
-              className="text-rose-400 hover:text-white font-mono text-xs"
-            >
-              Dismiss
-            </button>
+            <div className="flex items-center gap-2 self-end sm:self-auto shrink-0">
+              {teamId !== 2432 && (
+                <button
+                  onClick={() => {
+                    setError(null);
+                    handleSetTeamId(2432);
+                  }}
+                  className="px-2.5 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-[11px] transition-colors shadow-xs"
+                >
+                  Switch to Demo Team #2432
+                </button>
+              )}
+              <button
+                onClick={() => setError(null)}
+                className="px-2 py-1 text-rose-400 hover:text-white font-mono text-xs"
+              >
+                Dismiss
+              </button>
+            </div>
           </div>
         )}
 
@@ -702,15 +897,15 @@ export default function App() {
           </div>
         )}
 
-        {/* Team Input Onboarding Screen (If no team is connected) */}
-        {!teamId && bootstrap && (
+        {/* Team Input Onboarding / Recovery Screen (If no team is connected or squad failed to load) */}
+        {(!teamId || !picksData) && bootstrap && !loading && (
           <div className="max-w-md mx-auto py-8 sm:py-16 space-y-6">
             <div className="text-center space-y-2">
               <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-indigo-500/10 border border-indigo-500/20 text-indigo-300 text-xs font-semibold">
                 <Sparkles className="w-3.5 h-3.5" /> 100% Free · No Logins · Unofficial
               </div>
               <h2 className="text-2xl sm:text-3xl font-extrabold text-white tracking-tight">
-                Enter Your FPL Team ID
+                {teamId ? 'Enter or Change FPL Team ID' : 'Enter Your FPL Team ID'}
               </h2>
               <p className="text-xs sm:text-sm text-slate-400">
                 Unlock your explainable best starting XI, captain choice, transfer recommendations, and
@@ -726,22 +921,34 @@ export default function App() {
                 <div className="flex gap-2">
                   <input
                     type="number"
-                    placeholder="e.g. 1 or your team ID"
-                    value={teamIdInput}
+                    placeholder="e.g. 1, 2432, or your team ID"
+                    value={teamIdInput || (teamId ? String(teamId) : '')}
                     onChange={(e) => setTeamIdInput(e.target.value)}
                     onKeyDown={(e) => {
-                      if (e.key === 'Enter' && teamIdInput) {
-                        handleSetTeamId(Number(teamIdInput));
+                      if (e.key === 'Enter' && (teamIdInput || teamId)) {
+                        handleSetTeamId(Number(teamIdInput || teamId));
                       }
                     }}
                     className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-sm text-white placeholder-slate-400 focus:outline-none focus:border-indigo-500 font-mono"
                   />
                   <button
-                    onClick={() => teamIdInput && handleSetTeamId(Number(teamIdInput))}
+                    onClick={() => {
+                      const idToUse = Number(teamIdInput || teamId);
+                      if (idToUse) handleSetTeamId(idToUse);
+                    }}
                     className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition-all shadow-md shadow-indigo-600/30 active:scale-95 whitespace-nowrap"
                   >
                     Analyze Team
                   </button>
+                  {teamId && (
+                    <button
+                      onClick={handleClearTeam}
+                      className="px-3 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded-xl text-xs font-semibold transition-colors whitespace-nowrap"
+                      title="Clear saved team ID"
+                    >
+                      Clear
+                    </button>
+                  )}
                 </div>
               </div>
 
@@ -750,13 +957,28 @@ export default function App() {
                 <div className="text-[11px] text-slate-400 mb-2">Or test immediately with demo teams:</div>
                 <div className="flex flex-wrap gap-2">
                   <button
-                    onClick={() => handleSetTeamId(1)}
+                    onClick={() => {
+                      setError(null);
+                      handleSetTeamId(2432);
+                    }}
+                    className="px-3 py-1.5 rounded-lg bg-indigo-900/60 hover:bg-indigo-800/80 border border-indigo-700/50 text-indigo-200 text-xs font-semibold font-mono transition-colors flex items-center gap-1.5"
+                  >
+                    <span>⚡ Team #2432 (Top 10k Ready)</span>
+                  </button>
+                  <button
+                    onClick={() => {
+                      setError(null);
+                      handleSetTeamId(1);
+                    }}
                     className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-mono transition-colors"
                   >
                     Team #1 (Solio Moose)
                   </button>
                   <button
-                    onClick={() => handleSetTeamId(1000)}
+                    onClick={() => {
+                      setError(null);
+                      handleSetTeamId(1000);
+                    }}
                     className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-mono transition-colors"
                   >
                     Team #1000
@@ -791,7 +1013,7 @@ export default function App() {
         )}
 
         {/* Loaded Dashboard View */}
-        {teamId && bootstrap && (
+        {teamId && bootstrap && picksData && (
           <div className="space-y-4">
             {/* Desktop Navigation Tabs */}
             <div className="hidden md:flex bg-slate-900 border border-slate-800 rounded-2xl p-1.5 shadow-md max-w-fit">

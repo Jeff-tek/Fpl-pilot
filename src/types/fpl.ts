@@ -18,7 +18,7 @@ export interface FPLTeam {
   name: string;
   short_name: string;
   code: number;
-  strength: number;
+  strength?: number | null;
   strength_overall_home: number;
   strength_overall_away: number;
   strength_attack_home: number;
